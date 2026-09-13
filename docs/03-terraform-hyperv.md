@@ -73,6 +73,8 @@ Write down the `Name` column value for whichever adapter is actually
 connected to your LAN (e.g. `Ethernet` or `Wi-Fi`) — you'll need this for the
 Terraform virtual switch later.
 
+Name is : Ethernet 2
+
 ### 3. Install Terraform on Windows
 Via [Chocolatey](https://chocolatey.org/) if you have it: `choco install
 terraform`. Otherwise, download the Windows zip from
