@@ -1,20 +1,24 @@
 #Terraform
 .terraform/
-.tfvars
+*.tfvars
+!*-tfvars.example
+*.tfstate
+*.tfstate.*
 
 #Kubernetes
 *.secret.yaml
-
+kubeconfig
+*.kubeconfig
 
 #Artifacts
-.DS_Store/
-*.log/
+.DS_Store
+*.log
 .env
 
 #Images
-*.so/
-*.vhdx/
-*.img/
+*.iso
+*.vhdx
+*.img
 *.qcow2
 
 
