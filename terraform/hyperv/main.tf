@@ -22,3 +22,18 @@ resource "local_file" "user_data" {
     ufw_setup_script = file("${path.module}/../../cloud-init/ufw-setup.sh")
   })
 }
+
+resource "local_file" "network-config" {
+  filename = "${path.module}/build/network-config"
+  content  = templatefile("${path.module}/../../cloud-init/network-config.yaml.tpl", {
+    node_ip = var.node_ip
+  })
+}
+
+resource "local_file" "meta-data" {
+  filename = "${path.module}/build/meta-data"
+   content = <<-EOT
+    instance-id: ${var.node_name}
+    local-hostname: ${var.node_name}
+    EOT
+}
