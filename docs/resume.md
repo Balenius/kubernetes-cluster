@@ -109,86 +109,263 @@ no fallback needed, proceeding with real Terraform.**
    the *public* key content needs to reach Terraform (as a variable value) —
    the private key never needs to touch Windows.
 
-**Not yet decided:** the static LAN IP to reserve for the VM (`node_ip`
-variable) — needs picking and reserving on the router before `terraform
-apply`, not required yet for just `variables.tf`/`terraform init`.
+**`node_ip` decided:** `192.168.50.178` (LAN subnet, outside the router's
+DHCP pool — see the M3 doc for the external-switch networking reasoning).
+Still needs an actual DHCP-reservation/exclusion on the router before
+`terraform apply` touches real hardware, but the value itself is set in
+`variables.tf` now.
 
-## Next task (exact pickup point)
+### ✅ `terraform/hyperv/versions.tf` and `terraform/hyperv/variables.tf` — DONE
 
-Writing `terraform/hyperv/versions.tf` and `terraform/hyperv/variables.tf`.
+**`versions.tf`** — fixed boilerplate, given directly rather than as an
+exercise (content unchanged from what was planned — see git history for the
+file itself rather than duplicating it here).
 
-**`versions.tf`** — mostly fixed boilerplate, was given directly rather than
-as an exercise:
-```hcl
-terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    hyperv = {
-      source  = "taliesins/hyperv"
-      version = "~> 1.2"
-    }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.4"
-    }
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.2"
-    }
-  }
-}
-```
-(`local` and `null` are needed later in `main.tf` to render the cloud-init
-file to disk and run the `oscdimg` command that builds the seed ISO.)
-
-**`variables.tf`** — task given as a spec table, NOT written for the user yet
-(this is the live exercise). One worked syntax example was given
-(`node_name`), and the user is to write `variable` blocks for:
-
-| Variable | Purpose |
-|---|---|
-| `hyperv_host` | WinRM host — default `"localhost"` |
-| `hyperv_user`, `hyperv_password` | Windows admin creds (password `sensitive = true`) |
-| `hyperv_winrm_port`, `hyperv_winrm_https` | connection details |
-| `switch_name` | name for the Hyper-V virtual switch to create |
-| `host_net_adapter_name` | `"Ethernet 2"` (gathered above) |
-| `node_ip` | LAN IP to reserve for the VM — **not chosen yet** |
-| `node_name`, `cpus`, `memory_bytes`, `disk_size_bytes` | VM identity/sizing |
-| `ubuntu_vhdx_source` | `C:\HyperV\images\ubuntu-24.04.vhdx` |
-| `vhd_destination_path` | where the VM's own boot-disk copy will live |
-| `iso_tool` | default `"oscdimg"` |
-| `k3s_version` | pin one, e.g. `"v1.31.5+k3s1"` |
-| `ssh_authorized_key` | the public key content (from item 6 above) — no default, filled via `terraform.tfvars` later |
+**`variables.tf`** — written by the user as the live exercise, from a spec
+table covering all of: `hyperv_host`, `hyperv_user`/`hyperv_password`,
+`hyperv_winrm_port`/`hyperv_winrm_https`, `switch_name`,
+`host_net_adapter_name`, `node_ip`, `node_name`, `cpus`, `memory_bytes`,
+`disk_size_bytes`, `ubuntu_vhdx_source`, `vhd_destination_path`, `iso_tool`,
+`k3s_version`, `ssh_authorized_key`. Real bugs caught and fixed along the
+way (all now correct in the committed file):
+- **Backslash paths broke HCL parsing.** Windows paths like
+  `C:\HyperV\images\...` hit Terraform's string-escape handling (`\H`,
+  `\i`, `\u` aren't valid escapes), and a trailing `\"` before a closing
+  quote was read as an escaped quote character, leaving the string
+  unterminated. Fixed by switching to forward slashes
+  (`C:/HyperV/images/ubuntu-24.04.vhdx`) — Windows accepts those fine, and
+  it sidesteps HCL escaping entirely.
+- **`hyperv_wnrm_port`/`hyperv_wnrm_https` typo** → corrected to
+  `hyperv_winrm_port`/`hyperv_winrm_https`.
+- **Comma-grouped number literals** (`"4,294,967,296"`) aren't valid HCL —
+  no thousands-separator support, quoted or not. Rewritten as arithmetic
+  expressions for readability while staying real numbers:
+  `memory_bytes = 4 * 1024 * 1024 * 1024` (4 GiB),
+  `disk_size_bytes = 20 * 1024 * 1024 * 1024` (20 GiB — the original draft
+  value of ~1.2 GiB was too small to even hold the ~2.04 GiB source VHDX
+  being copied/grown from).
 
 Key concepts taught alongside this: the `terraform { required_providers }`
 block; the `variable` block shape (`description`/`type`/`default`/
-`sensitive`); and the caveat that `sensitive = true` only redacts CLI output
-— it does **not** encrypt `terraform.tfstate`, which is why `*.tfstate` stays
-in `.gitignore` (tie-back to the M0 lesson).
+`sensitive`); the caveat that `sensitive = true` only redacts CLI output —
+it does **not** encrypt `terraform.tfstate`, which is why `*.tfstate` stays
+in `.gitignore` (tie-back to the M0 lesson); HCL has no built-in size
+units (no `Gi`/`Mi` suffixes) — the Hyper-V provider's memory/disk fields
+are plain byte integers because the underlying Windows/Hyper-V WMI API
+itself works in bytes.
 
-**Verify step (once both files exist):**
-```bash
-mkdir -p terraform/hyperv     # if not already created
-cd terraform/hyperv
-# versions.tf and variables.tf go here
-terraform init
-```
-Expect all three providers to download and
-`Terraform has been successfully initialized!`. This step touches nothing in
-Hyper-V yet — pure config/provider validation.
+**Also confirmed: Terraform must run from Windows PowerShell, not WSL,**
+for this module specifically — `hyperv_host` defaults to `"localhost"`, and
+the WinRM firewall rule from host prep is locked to `127.0.0.1` only. WSL2
+runs in its own network namespace with a separate virtual NIC, so a
+`localhost` connection from inside WSL does not land on the Windows host's
+real loopback interface the way a process running directly on Windows does
+— the WinRM connection would likely be refused. The `.tf` files live in the
+WSL filesystem but are reached from PowerShell via the `\\wsl$\<Distro>\...`
+(or `\\wsl.localhost\<Distro>\...`) UNC path.
+
+**Verified:** `terraform init` run from Windows PowerShell in
+`terraform/hyperv/` succeeded — all three providers downloaded (`hyperv`
+1.2.1, `local` 2.9.1, `null` 3.3.2), `.terraform.lock.hcl` generated,
+`Terraform has been successfully initialized!`. `.terraform/` and
+`*.tfstate` are already covered by the existing `.gitignore` from M0. This
+step touched nothing in Hyper-V yet — pure config/provider validation.
+
+### 🔧 `terraform/hyperv/main.tf` — IN PROGRESS (started, not complete)
+
+So far, two pieces written and reviewed correct:
+
+- **The `provider "hyperv" {}` block** — given directly (provider-specific
+  connection plumbing, not a teaching moment), wired to
+  `hyperv_user`/`hyperv_password`/`hyperv_host`/`hyperv_winrm_port`/
+  `hyperv_winrm_https`, plus `insecure = true` and `use_ntlm = true` (needed
+  because this is a local self-signed WinRM setup, not a domain).
+- **`resource "hyperv_network_switch" "main" {}`** — user-written exercise.
+  Mistakes caught and fixed along the way: confused the `resource "<TYPE>"
+  "<LOCAL_NAME>" {}` declaration syntax with a later *reference* to the
+  resource (wrote the dotted `type.name.attribute` reference string as if it
+  were the type/name themselves); and an unquoted `switch_type = External`
+  (HCL treats a bare word as an identifier lookup, not a string — needs
+  quotes). Both fixed; block is now correct (`name = var.switch_name`,
+  `switch_type = "External"`, `net_adapter_names = [var.host_net_adapter_name]`).
+
+### ✅ `cloud-init/user-data.yaml.tpl` — DONE
+
+New territory: YAML cloud-config (not HCL), templated via Terraform's
+`templatefile()` — `${...}` placeholders in this file are Terraform template
+interpolation, filled in later when `main.tf` calls `templatefile()` (not
+written yet). Three top-level keys: `hostname` (`${node_name}`),
+`ssh_authorized_keys` (a YAML list, one item: `${ssh_authorized_key}`), and
+`runcmd` (a YAML list, one item: the k3s scripted install pinned via
+`INSTALL_K3S_VERSION=${k3s_version}`).
+
+Mistakes caught and fixed: first draft copy-pasted Terraform `variable "..."
+{ }` block syntax around the whole thing (doesn't exist in YAML) and used
+`key = value` (HCL) instead of `key: value` (YAML); then over-corrected by
+making `hostname` a YAML list when it needed to stay a single scalar value
+(only `ssh_authorized_keys` and `runcmd` are genuinely lists, since only
+those could have more than one item).
+
+**Aside, worth remembering:** the user tested the k3s install command
+directly in their WSL shell (`curl -sfL https://get.k3s.io |
+INSTALL_K3S_VERSION=v1.31.5+k3s1 sh -`) to see it work — this actually
+installed and started a real k3s server **on the WSL dev box itself**, not
+inside a VM (no VM exists yet). Uninstalled afterward via
+`sudo /usr/local/bin/k3s-uninstall.sh` (the installer drops this script for
+undoing itself; `sudo systemctl stop k3s` would only pause it). Confirms WSL
+here has systemd enabled (k3s's installer refuses to proceed without
+systemd/openrc as a supervisor). Worth remembering if k3s ever gets tested
+ad-hoc again: it's a real service with real system-level changes, not a
+sandboxed thing — uninstall it when done experimenting outside the VM.
+
+### ✅ `cloud-init/ufw-setup.sh` — DONE
+
+Plain bash, not templated (no `${...}` vars needed). Default-deny-incoming
+model: `ufw default deny incoming` / `ufw default allow outgoing`, then
+explicit `ufw allow <port> proto tcp comment "..."` for exactly three ports
+— `22` (SSH — without this the VM is unreachable), `6443` (Kubernetes API
+server — what lets `kubectl` from outside the VM talk to the cluster), `80`
+(HTTP, for Traefik ingress once M4 adds one). `443` deliberately skipped for
+now (plan is LAN-only, no TLS yet). Enabled non-interactively via
+`ufw enable --force` (cloud-init has no human to answer prompts).
+
+Mistakes caught and fixed: `-force` (single dash, gets parsed as bundled
+short flags, not the long-form flag) → `--force`; missing shebang line
+(`#!/bin/bash`) added; file was briefly named `ufw.sh` before being renamed
+to match the plan's `ufw-setup.sh` (old file confirmed not left behind).
+
+**Now wired up:** its contents get onto the VM via `user-data.yaml.tpl`'s
+`write_files:` (writes it to `/usr/local/bin/ufw-setup.sh`, `permissions:
+'0755'`) + `runcmd:` (executes it, deliberately *before* the k3s install
+line — lock the firewall down first). See the `user-data.yaml.tpl` entry
+below for the mistakes made getting this wired up correctly.
+
+### ✅ `cloud-init/network-config.yaml.tpl` — DONE
+
+Netplan-style (`version: 2`) NoCloud `network-config`, for `node_ip`'s
+**static IP**. One interface key (`eth0` — Ubuntu cloud images on Hyper-V
+commonly come up as `eth0`; unconfirmed until first real boot — if the VM
+isn't reachable after `terraform apply`, wrong interface name is the first
+thing to suspect, and it means dropping to the Hyper-V console/VM Connect
+window since SSH wouldn't be reachable either), `addresses: [${node_ip}/24]`,
+a default route `via:` the gateway, `nameservers.addresses:`. Gateway
+(`192.168.50.1`) and DNS confirmed correct by the user via `ipconfig`/router
+admin, not assumed.
+
+Mistake caught and fixed: first draft literally kept `<interface-name>: eth0`
+(the placeholder text itself) instead of replacing it with the real YAML key
+`eth0:`.
+
+### ✅ `user-data.yaml.tpl` — `write_files:`/`runcmd:` wiring — DONE
+
+Added a `write_files:` entry (path `/usr/local/bin/ufw-setup.sh`,
+`permissions: '0755'`, `content: |` literal block) and a second `runcmd:`
+item to execute it before the k3s install line. The real teaching content
+here was **`${indent(6, ufw_setup_script)}`** — `ufw_setup_script` gets
+passed into `templatefile()` from `main.tf` as `file(".../ufw-setup.sh")`
+(raw, unrendered text, since the script itself has no `${...}` to fill in).
+`indent(n, string)` only prepends `n` spaces to the *2nd and later* lines of
+a multi-line string — the first line's position comes entirely from how much
+literal whitespace precedes `${...}` in the template itself. Those two
+numbers (the literal leading spaces in the `.tpl` file, and the `n` argument
+to `indent()`) have to match, or the rendered YAML block ends up with
+mismatched indentation partway through and breaks. Went through several
+wrong states before landing correctly: `|` with content on the same line
+(invalid — `|` must be alone on its line), then correct-line but 14 spaces
+(mismatched with `indent(6, ...)`), finally 6 spaces matching. Also fixed
+along the way: `runcmd:`'s second command was written as a continuation of
+the first list item (missing its own `- ` marker), which would have folded
+both commands into one nonsense string instead of two separate commands.
+
+### 🔧 `terraform/hyperv/main.tf` — IN PROGRESS (expanded further)
+
+Beyond the provider block and `hyperv_network_switch.main` (see above), three
+`local_file` resources now written, reviewed, and **`terraform validate`
+passes**:
+
+- **`local_file.user_data`** — `templatefile()` over `user-data.yaml.tpl`
+  with vars `node_name`, `ssh_authorized_key`, `k3s_version`,
+  `ufw_setup_script` (the last via plain `file()`, not `templatefile()` —
+  the script itself isn't templated). Mistakes fixed: vars-map key named
+  `hostname` instead of `node_name` (map keys must match the template's
+  placeholder names, not the YAML key the value happens to fill); a bare
+  `file(...)` call with no `key =` in front (map entries need
+  `key = value` like anywhere else in HCL); `ssh_authorized_keys` (wrong,
+  plural) instead of `ssh_authorized_key` (matches neither the declared
+  variable nor the template placeholder, both singular).
+- **`local_file.network-config`** — same pattern, one var (`node_ip`).
+  Correct on first attempt.
+- **`local_file.meta-data`** — no `.tpl` file for this one (content's only
+  2 lines: `instance-id`/`local-hostname`, both `var.node_name`) — built
+  directly as an HCL string via a heredoc (`<<-EOT ... EOT`) instead.
+  Mistake caught: first drafts tried writing YAML-style `key: value` lines
+  and a bogus `node_name = var.node_name` as if they were `local_file`
+  resource arguments (they're not — `local_file` only knows `filename`/
+  `content`/etc.; the YAML-looking lines need to be literal text *inside*
+  the `content` string). Then a heredoc indentation subtlety: with `<<-`,
+  the amount of leading whitespace stripped from every content line is
+  determined by **the closing marker's own indentation**, not the content
+  lines' — first draft had `EOT` flush-left while content was indented 4
+  spaces, so nothing got stripped and the rendered file would have had
+  literal leading spaces; fixed by indenting `EOT` to match.
+
+Key concept taught: `path.module` (the directory containing the current
+`.tf` file) is needed throughout because `cloud-init/*.tpl` files live at
+the repo root, two directories above `terraform/hyperv/` — paths are built
+as `"${path.module}/../../cloud-init/<file>"`. Output files are written to
+a new `terraform/hyperv/build/` directory (`local_file` creates missing
+parent dirs automatically) — **still needs adding to `.gitignore`** as
+generated output, not done yet.
+
+## Next task (exact pickup point)
+
+The `null_resource` + `oscdimg` piece of `main.tf`, to build the NoCloud
+seed ISO from the three rendered `build/` files. Explained, not yet written:
+
+- **Concept:** `null_resource` (from the `null` provider) manages nothing
+  real — its only job is to host a `provisioner` block, for running a
+  command Terraform has no natural resource type for.
+- **`provisioner "local-exec"`** runs a shell command on the machine running
+  `terraform apply` itself (Windows, in this setup) — not on the VM.
+- **`triggers`** (a map) is how `null_resource` knows whether to rerun its
+  provisioner — it has no real state to diff against otherwise. Plan:
+  reference `local_file.user_data.content_md5` (and the other two
+  `local_file`s' `content_md5`) so it reruns whenever the rendered content
+  changes, and so Terraform's dependency graph waits for all three
+  `local_file`s to finish first.
+- **The actual command** (given directly — Windows ADK tool syntax, not a
+  Terraform concept):
+  `oscdimg -n -m -lcidata "<build folder>" "<build folder>/seed.iso"` — the
+  `-lcidata` volume label is **not cosmetic**, NoCloud's datasource
+  specifically looks for a volume labeled exactly `cidata` to recognize the
+  seed disk.
+- User should reference `var.iso_tool` rather than hardcoding `oscdimg`.
 
 ## What comes after this (per the plan, not started)
-- `main.tf` — provider block; cloud-init rendering via `templatefile()` +
-  `local_file` (writing `user-data`/`meta-data`) + `null_resource` with a
-  `local-exec` provisioner running `oscdimg`; the Hyper-V virtual switch;
-  copying/growing the VHDX; the `hyperv_machine_instance` VM resource tying
-  it all together.
+- The `null_resource`/`oscdimg` block itself (see above).
+- VHDX copy/grow from `ubuntu_vhdx_source` to `vhd_destination_path`, sized
+  to `disk_size_bytes`.
+- The `hyperv_machine_instance` resource tying node identity (`node_name`,
+  `cpus`, `memory_bytes`), the switch, the boot disk, and the seed ISO
+  together.
+- Add `terraform/hyperv/build/` to `.gitignore` (generated output).
 - `outputs.tf`, `terraform.tfvars` (git-ignored, real values) and
   `terraform.tfvars.example` (committed, placeholder values).
 - `terraform apply`, fetch the kubeconfig, `kubectl get nodes` → `Ready`.
 - Then M4 (raw Kubernetes manifests) → M5 (Kustomize) → M6 (Argo CD) → M7
   (GitHub Actions CI/CD) → M8 (Pi/AWS portability, scaffolded only).
+
+## Design notes (asked and answered along the way)
+
+**Single-node, on purpose.** This is a single-node k3s cluster, not
+multi-node — `node_ip`, `node_name`, `cpus` etc. in `variables.tf` are
+singular on purpose, matching the plan's `terraform apply` → one VM →
+`kubectl get nodes` → one `Ready` node. Deliberate simplicity/resource
+choice for a home-lab-on-one-Hyper-V-host setup, not an oversight — k3s
+supports adding more nodes later (agents joining via `K3S_URL` + a token),
+so the door isn't closed, just out of scope for this build. Would need
+`variables.tf`/`main.tf` reworked toward a list/`count`- or
+`for_each`-based node resource if that ever changes.
 
 ## Docs written so far (this folder)
 - `00-orientation.md` — the big picture / two-layer architecture / build order.
