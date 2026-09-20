@@ -13,7 +13,7 @@ resource "hyperv_network_switch" "main" {
   net_adapter_names = [ var.host_net_adapter_name ]
 }
 
-resource "local_file" "user_data" {
+resource "local_file" "user-data" {
   filename = "${path.module}/build/user-data"
   content  = templatefile("${path.module}/../../cloud-init/user-data.yaml.tpl", {
     node_name = var.node_name
@@ -36,4 +36,15 @@ resource "local_file" "meta-data" {
     instance-id: ${var.node_name}
     local-hostname: ${var.node_name}
     EOT
+}
+
+resource "null_resource" "build_seed_iso" {
+  provisioner "local-exec" {
+    command = " ${var.iso_tool} -n -m -lcidata \"${path.module}/build\" \"${path.module}/build/seed.iso\""
+  }
+  triggers = { 
+    user-data = local_file.user-data.content_md5
+    network-config = local_file.network-config.content_md5
+    meta-data = local_file.meta-data.content_md5
+  }
 }
