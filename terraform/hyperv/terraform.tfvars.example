@@ -1,0 +1,4 @@
+node_name = "nodename"
+hyperv_password = "password"
+switch_name = "name-of-switch"
+ssh_authorized_key = "ssh-ed25519 key"
