@@ -277,22 +277,21 @@ along the way: `runcmd:`'s second command was written as a continuation of
 the first list item (missing its own `- ` marker), which would have folded
 both commands into one nonsense string instead of two separate commands.
 
-### 🔧 `terraform/hyperv/main.tf` — IN PROGRESS (expanded further)
+### ✅ `terraform/hyperv/main.tf` — `local_file` resources (DONE)
 
-Beyond the provider block and `hyperv_network_switch.main` (see above), three
-`local_file` resources now written, reviewed, and **`terraform validate`
-passes**:
+Three `local_file` resources, reviewed, **`terraform validate` passes**:
 
-- **`local_file.user_data`** — `templatefile()` over `user-data.yaml.tpl`
-  with vars `node_name`, `ssh_authorized_key`, `k3s_version`,
-  `ufw_setup_script` (the last via plain `file()`, not `templatefile()` —
-  the script itself isn't templated). Mistakes fixed: vars-map key named
-  `hostname` instead of `node_name` (map keys must match the template's
-  placeholder names, not the YAML key the value happens to fill); a bare
-  `file(...)` call with no `key =` in front (map entries need
-  `key = value` like anywhere else in HCL); `ssh_authorized_keys` (wrong,
-  plural) instead of `ssh_authorized_key` (matches neither the declared
-  variable nor the template placeholder, both singular).
+- **`local_file.user-data`** (renamed from `user_data` — see rename note
+  below) — `templatefile()` over `user-data.yaml.tpl` with vars `node_name`,
+  `ssh_authorized_key`, `k3s_version`, `ufw_setup_script` (the last via
+  plain `file()`, not `templatefile()` — the script itself isn't
+  templated). Mistakes fixed: vars-map key named `hostname` instead of
+  `node_name` (map keys must match the template's placeholder names, not
+  the YAML key the value happens to fill); a bare `file(...)` call with no
+  `key =` in front (map entries need `key = value` like anywhere else in
+  HCL); `ssh_authorized_keys` (wrong, plural) instead of
+  `ssh_authorized_key` (matches neither the declared variable nor the
+  template placeholder, both singular).
 - **`local_file.network-config`** — same pattern, one var (`node_ip`).
   Correct on first attempt.
 - **`local_file.meta-data`** — no `.tpl` file for this one (content's only
@@ -313,45 +312,138 @@ Key concept taught: `path.module` (the directory containing the current
 `.tf` file) is needed throughout because `cloud-init/*.tpl` files live at
 the repo root, two directories above `terraform/hyperv/` — paths are built
 as `"${path.module}/../../cloud-init/<file>"`. Output files are written to
-a new `terraform/hyperv/build/` directory (`local_file` creates missing
-parent dirs automatically) — **still needs adding to `.gitignore`** as
-generated output, not done yet.
+`terraform/hyperv/build/` (`local_file` creates missing parent dirs
+automatically) — now in `.gitignore` (see below).
+
+### ✅ `terraform/hyperv/main.tf` — `null_resource.build_seed_iso` (DONE)
+
+Builds the NoCloud seed ISO from the three rendered `build/` files:
+
+```hcl
+resource "null_resource" "build_seed_iso" {
+  provisioner "local-exec" {
+    command = " ${var.iso_tool} -n -m -lcidata \"${path.module}/build\" \"${path.module}/build/seed.iso\""
+  }
+  triggers = {
+    user-data       = local_file.user-data.content_md5
+    network-config  = local_file.network-config.content_md5
+    meta-data       = local_file.meta-data.content_md5
+  }
+}
+```
+
+Concepts: `null_resource` (from the `null` provider) manages nothing real —
+it only hosts a `provisioner` block, for running a command Terraform has no
+native resource type for. `provisioner "local-exec"` runs on the machine
+executing `terraform apply` (Windows here), not on the VM. `triggers` (a
+map) is how `null_resource` knows to rerun its provisioner, since it has no
+real state to diff — referencing all three `local_file.*.content_md5`
+values means it reruns whenever rendered content changes, and forces
+Terraform's dependency graph to wait for all three `local_file`s first.
+`-lcidata` is **not cosmetic** — NoCloud's datasource specifically looks
+for a volume labeled exactly `cidata`.
+
+Mistakes fixed along the way (several passes): command written as a bare
+line with no `provisioner` block around it at all; then a `provisioner
+"local-exec" command = "..."` with the `command` argument missing its
+enclosing `{ }` body; then the command string's embedded path-quotes
+weren't escaped (`\"..\"`), which ended the outer string early; `triggers`
+first written as a YAML-style list (`- item`) instead of an HCL map
+(`key = value`); and a reference to `local_file.meta_data` (underscore)
+that didn't match the actual declared resource name `local_file.meta-data`
+(hyphen) — resource references must match the declared local name exactly.
+Also initially named `null_resource.meta-data`, colliding (confusingly,
+though not erroring, since type+name is the real address) with the
+unrelated `local_file.meta-data` — renamed to `build_seed_iso`.
+
+### ✅ `terraform/hyperv/main.tf` — `hyperv_vhd.boot_disk` (DONE)
+
+```hcl
+resource "hyperv_vhd" "boot_disk" {
+  path     = "${var.vhd_destination_path}/${var.node_name}.vhdx"
+  source   = var.ubuntu_vhdx_source
+  size     = var.disk_size_bytes
+  vhd_type = "Dynamic"
+}
+```
+
+Copies `ubuntu_vhdx_source` (the shared, reusable base image) to a
+VM-specific file at `vhd_destination_path`, grown to `disk_size_bytes` —
+needed because the VM can't write directly onto the shared base image
+(would corrupt it / block reuse for future VMs). Mistake fixed: `path`'s
+string was missing its closing `"`, leaving it unterminated.
+
+Also covered: the `${var.x}` vs bare `var.x` rule — bare (no quotes, no
+`${}`) when the whole argument value is just that one reference (`source`,
+`size`); `"${var.x}/${var.y}.ext"` interpolation only needed when mixing a
+variable into a larger string with literal text.
+
+### Rename note: `local_file.user_data` → `local_file.user-data`
+
+Not itself part of the plan — came up when standardizing naming style
+across the `local_file` resources. Real state is currently **empty** (no
+`apply` has been run against real Hyper-V yet), so this specific rename
+cost nothing. But covered as a concept for when it matters (e.g. once
+`hyperv_machine_instance` is real infrastructure): a resource's address
+(`type.name`) is its identity in `terraform.tfstate`; renaming it in config
+without telling Terraform makes the next plan show a destroy (old address)
++ create (new address) instead of an in-place rename — fine for a
+`local_file`, potentially an outage/data-loss for a VM/disk/DB. Two ways to
+handle it safely: a `moved` block (`moved { from = old_addr; to = new_addr
+}`, a top-level block, e.g. placed directly above the resource it
+describes — declarative, versioned in git, applies automatically on the
+next `plan`/`apply` for anyone) or `terraform state mv <old> <new>` (an
+imperative one-off CLI edit to the state, not captured in code, easy for a
+teammate to miss). Also noted: the state update only actually persists
+after an `apply` — a `plan` alone doesn't write state, so a `moved` block
+should stay in the config until an `apply` has actually run, then it's
+safe to delete.
+
+### ✅ `terraform/hyperv/outputs.tf` — DONE
+
+```hcl
+output "node_ip" {
+  description = "IP of node"
+  value       = var.node_ip
+}
+```
+Surfaces the address you'll actually `ssh`/`kubectl` to after `apply`
+(via `terraform output`), rather than having to remember it from
+`variables.tf`.
+
+### ✅ `.gitignore` — `terraform/hyperv/build/` added (DONE)
+
+Generated Terraform output (rendered cloud-init files + seed ISO) —
+reproducible from source, doesn't belong in git.
+
+### ✅ `terraform/hyperv/terraform.tfvars` + `terraform.tfvars.example` — DONE
+
+Four variables in `variables.tf` have no `default` (would prompt or fail
+non-interactively without a value): `hyperv_password`, `switch_name`,
+`node_name`, `ssh_authorized_key`. `terraform.tfvars` supplies real values
+for these (confirmed still correctly git-ignored via the existing
+`*.tfvars` / `!*.tfvars.example` pair — not tracked, not staged);
+`terraform.tfvars.example` has the same four keys with obvious placeholder
+values, committed.
 
 ## Next task (exact pickup point)
 
-The `null_resource` + `oscdimg` piece of `main.tf`, to build the NoCloud
-seed ISO from the three rendered `build/` files. Explained, not yet written:
-
-- **Concept:** `null_resource` (from the `null` provider) manages nothing
-  real — its only job is to host a `provisioner` block, for running a
-  command Terraform has no natural resource type for.
-- **`provisioner "local-exec"`** runs a shell command on the machine running
-  `terraform apply` itself (Windows, in this setup) — not on the VM.
-- **`triggers`** (a map) is how `null_resource` knows whether to rerun its
-  provisioner — it has no real state to diff against otherwise. Plan:
-  reference `local_file.user_data.content_md5` (and the other two
-  `local_file`s' `content_md5`) so it reruns whenever the rendered content
-  changes, and so Terraform's dependency graph waits for all three
-  `local_file`s to finish first.
-- **The actual command** (given directly — Windows ADK tool syntax, not a
-  Terraform concept):
-  `oscdimg -n -m -lcidata "<build folder>" "<build folder>/seed.iso"` — the
-  `-lcidata` volume label is **not cosmetic**, NoCloud's datasource
-  specifically looks for a volume labeled exactly `cidata` to recognize the
-  seed disk.
-- User should reference `var.iso_tool` rather than hardcoding `oscdimg`.
+The `hyperv_machine_instance` resource in `main.tf` — the one that actually
+creates the VM. Not yet explained in detail or started. Needs to tie
+together: `node_name`/`cpus`/`memory_bytes` (node identity/sizing),
+`hyperv_network_switch.main` (network), `hyperv_vhd.boot_disk` (boot disk),
+and `null_resource.build_seed_iso`'s output ISO (mounted as a DVD drive so
+cloud-init can read it on first boot). Its exact schema (e.g.
+`hard_disk_drives` block, `dvd_drives` block, `network_adaptors` block,
+`generation`) hasn't been looked up/taught yet — do that first when
+resuming, from the `taliesins/hyperv` provider docs, before handing it to
+the user as an exercise.
 
 ## What comes after this (per the plan, not started)
-- The `null_resource`/`oscdimg` block itself (see above).
-- VHDX copy/grow from `ubuntu_vhdx_source` to `vhd_destination_path`, sized
-  to `disk_size_bytes`.
-- The `hyperv_machine_instance` resource tying node identity (`node_name`,
-  `cpus`, `memory_bytes`), the switch, the boot disk, and the seed ISO
-  together.
-- Add `terraform/hyperv/build/` to `.gitignore` (generated output).
-- `outputs.tf`, `terraform.tfvars` (git-ignored, real values) and
-  `terraform.tfvars.example` (committed, placeholder values).
-- `terraform apply`, fetch the kubeconfig, `kubectl get nodes` → `Ready`.
+- The `hyperv_machine_instance` resource (see above — this is the last
+  piece before a real `apply`).
+- `terraform apply` for real, against actual Hyper-V. Fetch the kubeconfig,
+  `kubectl get nodes` → `Ready`.
 - Then M4 (raw Kubernetes manifests) → M5 (Kustomize) → M6 (Argo CD) → M7
   (GitHub Actions CI/CD) → M8 (Pi/AWS portability, scaffolded only).
 
@@ -372,7 +464,13 @@ so the door isn't closed, just out of scope for this build. Would need
 - `01-docker.md` — Docker concepts + both Dockerfiles (backend, frontend/nginx).
 - `02-docker-compose.md` — Compose concepts + the three-service file.
 - `03-terraform-hyperv.md` — IaC/Terraform/cloud-init concepts + the 6-item
-  host prep checklist (all confirmed done, see above).
+  host prep checklist, plus (backfilled this session) the `variables.tf`,
+  `main.tf` (provider/switch/`local_file`), and cloud-init file lessons.
+  Still not caught up as of this resume: `null_resource`, `hyperv_vhd`,
+  `outputs.tf`, `.tfvars`, and the rename/`moved`-block detour (all done in
+  code, only in this resume file's notes above, not yet written into the
+  doc's prose) — backfill those next time doc-writing comes up, or continue
+  the exercise first and catch the doc up when there's a natural pause.
 - `resume.md` — this file.
 
 ## Misc environment notes
