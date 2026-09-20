@@ -4,6 +4,7 @@
 !*.tfvars.example
 *.tfstate
 *.tfstate.*
+terraform/hyperv/build/
 
 #Kubernetes
 *.secret.yaml
