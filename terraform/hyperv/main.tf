@@ -48,3 +48,10 @@ resource "null_resource" "build_seed_iso" {
     meta-data = local_file.meta-data.content_md5
   }
 }
+
+resource "hyperv_vhd" "boot_disk" {
+  path = "${var.vhd_destination_path}/${var.node_name}.vhdx"
+  source = var.ubuntu_vhdx_source
+  size = var.disk_size_bytes
+  vhd_type = "Dynamic"
+}
