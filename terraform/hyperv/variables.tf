@@ -1,9 +1,9 @@
 variable "hyperv_host" {
-    default = "localhost"
+    default = "127.0.0.1"
 }
 
 variable "hyperv_user" {
-    default = "balen"
+    default = "hyperv"
 }
 
 variable "hyperv_password" {
@@ -21,11 +21,11 @@ variable "host_net_adapter_name" {
 }
 
 variable "hyperv_winrm_port" {
-    default = "5986"
+    default = "5985"
 }
 
 variable "hyperv_winrm_https" {
-    default = "true"
+    default = "false"
 }
 
 variable "node_ip" {
@@ -60,8 +60,12 @@ variable "ubuntu_vhdx_source" {
     default = "C:/HyperV/images/ubuntu-24.04.vhdx"
 }
 
+variable "build_dir" {
+    default = "C:/HyperV/build"
+}
+
 variable "vhd_destination_path" {
-    default = "E:/Hyper-V/terraform/"
+    default = "E:/Hyper-V/terraform"
 }
 
 variable "ssh_authorized_key" {
