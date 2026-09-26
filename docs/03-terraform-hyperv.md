@@ -365,16 +365,312 @@ spaces.
 
 `terraform validate` passes with the file in this state.
 
+> **Note:** the `build/` directory referenced above later moved off the WSL
+> filesystem to a native Windows path (`C:/HyperV/build`, via a new
+> `build_dir` variable). The reason is in the Windows/WSL section near the
+> end of this doc — short version: Hyper-V can't mount an ISO from a
+> `\\wsl.localhost\` path.
+
+## Building the seed ISO — `null_resource` + `local-exec`
+
+Some things have no natural Terraform resource type. Building an ISO is one:
+there's no "ISO" object in any provider to declare. For those, you use
+`null_resource` — a resource from the `null` provider that manages nothing at
+all. Its only purpose is to host a **provisioner**.
+
+```hcl
+resource "null_resource" "build_seed_iso" {
+  provisioner "local-exec" {
+    command = "${var.iso_tool} -n -m -lcidata ${local.build_dir_win} ${local.build_dir_win}\\seed.iso"
+  }
+  triggers = {
+    user-data      = local_file.user-data.content_md5
+    network-config = local_file.network-config.content_md5
+    meta-data      = local_file.meta-data.content_md5
+  }
+}
+```
+
+Three concepts:
+
+- **`provisioner "local-exec"`** runs a shell command on the machine running
+  `terraform apply` — here, Windows. Not on the VM. (There's also
+  `remote-exec`, which runs *on* a created resource over SSH/WinRM; not used
+  here.)
+- **`triggers`** is a map that tells `null_resource` when to re-run. It has
+  no real-world state to diff against, so without this it would run once and
+  never again. Referencing all three `local_file.*.content_md5` values means
+  the ISO gets rebuilt whenever any rendered cloud-init content changes —
+  *and* it forces Terraform's dependency graph to finish writing those three
+  files first.
+- **`-lcidata`** is not cosmetic. cloud-init's NoCloud datasource looks for a
+  disk volume labeled exactly `cidata`; get that wrong and the VM boots with
+  no configuration at all.
+
+Recurring mistake worth naming, because it showed up three separate times
+across this module: **HCL block bodies and maps are `key = value` pairs, not
+YAML lists.** The `- item` reflex from all the cloud-init YAML kept leaking
+into `triggers`, and later into the VM resource's nested blocks. Different
+file, different language.
+
+## The boot disk — `hyperv_vhd`
+
+```hcl
+resource "hyperv_vhd" "boot_disk" {
+  path   = local.boot_disk_path_win
+  source = var.ubuntu_vhdx_source
+  size   = var.disk_size_bytes
+}
+```
+
+`source` copies the shared Ubuntu base image; `size` grows the copy. The copy
+matters: the VM must not write onto the base image, or it's corrupted for
+every future VM built from it.
+
+Note there's **no `vhd_type`** here. The provider declares `vhd_type` as
+conflicting with `source` — when you copy an existing VHD, the copy inherits
+its type (Fixed/Dynamic/Differencing) from the source file, so it isn't
+yours to set. The source was already made dynamic back in host prep, via
+`qemu-img convert -o subformat=dynamic`.
+
+### `${var.x}` vs bare `var.x`
+
+A question that comes up constantly. The rule:
+
+- **Bare `var.x`** — when the entire argument value is that one reference and
+  nothing else. `source = var.ubuntu_vhdx_source`, `size = var.disk_size_bytes`.
+- **`"${var.x}/literal.txt"`** — only when mixing a reference into a larger
+  string alongside literal text.
+
+Older examples online wrap everything in `"${...}"` even for a lone
+reference; that was mandatory in Terraform 0.11 and isn't anymore.
+
+## `locals`
+
+```hcl
+locals {
+  build_dir_win      = replace(var.build_dir, "/", "\\")
+  boot_disk_path_win = replace("${var.vhd_destination_path}/${var.node_name}.vhdx", "/", "\\")
+}
+```
+
+A `locals` block computes named values once for reuse as `local.<name>`.
+Distinct from a `variable`, which is an *input* someone supplies from
+`.tfvars` or the CLI — a local is derived inside the module and can't be
+overridden. Used here to avoid repeating the same backslash conversion in
+several places; see the Windows/WSL section for why that conversion exists.
+
+## The VM — `hyperv_machine_instance`
+
+The resource that finally creates something bootable. It has a large schema
+(firmware, QoS, integration services, NUMA…); this build uses a small subset.
+
+```hcl
+resource "hyperv_machine_instance" "hyperv_node" {
+  name                 = var.node_name
+  generation           = 2
+  processor_count      = var.cpus
+  static_memory        = true
+  memory_startup_bytes = var.memory_bytes
+
+  network_adaptors {
+    name         = "nic0"
+    switch_name  = hyperv_network_switch.main.name
+    wait_for_ips = false
+  }
+
+  hard_disk_drives {
+    controller_type     = "Scsi"
+    controller_number   = 0
+    controller_location = 0
+    path                = hyperv_vhd.boot_disk.path
+  }
+
+  dvd_drives {
+    controller_number   = 0
+    controller_location = 1
+    path                = "${var.build_dir}/seed.iso"
+  }
+
+  vm_firmware {
+    enable_secure_boot   = "On"
+    secure_boot_template = "MicrosoftUEFICertificateAuthority"
+
+    boot_order {
+      boot_type           = "HardDiskDrive"
+      controller_number   = 0
+      controller_location = 0
+    }
+  }
+
+  depends_on = [null_resource.build_seed_iso]
+}
+```
+
+Things worth understanding rather than copying:
+
+- **`generation = 2`** — UEFI rather than legacy BIOS. Ubuntu 24.04 cloud
+  images expect it. It also means **no IDE controllers exist**, which is why
+  the disk uses `controller_type = "Scsi"`.
+- **Controller numbering.** The disk sits at `(0,0)` and the DVD at `(0,1)` —
+  same controller, different locations. Two devices can't share a location.
+- **`hard_disk_drives.path = hyperv_vhd.boot_disk.path`** — referencing the
+  resource (rather than rebuilding the same string from a local) is what
+  creates the implicit dependency edge telling Terraform the VM must wait for
+  the disk. Attribute references *are* the dependency graph.
+- **`depends_on = [null_resource.build_seed_iso]`** — needed precisely
+  because `null_resource` exposes no attribute worth referencing. The DVD's
+  `path` is a plain string, so nothing implicitly connects the two; without
+  this, Terraform might create the VM before the ISO exists. This is the
+  narrow, legitimate use of `depends_on`: a real dependency that isn't
+  expressible as a reference.
+
+## Windows, WSL, and a community provider: what actually went wrong
+
+This module was flagged from the start as the likely rough patch, and it was.
+The configuration above is correct, but getting a successful `apply` meant
+working through a series of environment problems that had nothing to do with
+Kubernetes. They're documented here because every one of them will recur if
+this is ever rebuilt.
+
+The root of most of them: **the repo lives in WSL, but Terraform runs on
+Windows**, reaching the files over the `\\wsl.localhost\...` share. That
+share is a 9P network filesystem, and various Windows components don't treat
+it like a real disk.
+
+**1. State locking doesn't work — use `-lock=false`.**
+`Error acquiring the state lock ... Incorrect function.` Terraform's local
+backend uses a Windows file-locking syscall the 9P share doesn't implement.
+Every command in this module needs `terraform <cmd> -lock=false`. Normally
+disabling locking is bad advice; it's acceptable here because it's a single
+user with local state and no concurrent runs. Locking protects against two
+people writing shared state at once — a risk that doesn't exist in this setup.
+
+**2. WinRM must match what the host actually has.**
+The variables initially specified port 5986 with HTTPS. But host prep only
+ever created the **HTTP** listener on **5985** — an HTTPS listener requires
+generating a certificate, which was never done. Check reality with:
+```powershell
+winrm enumerate winrm/config/listener
+```
+Also: `hyperv_host` should be `127.0.0.1`, not `localhost`. `localhost`
+resolves to IPv6 `[::1]` first, but the firewall rule hardened during host
+prep is scoped to the IPv4 literal.
+
+**3. Windows Hello makes WinRM auth awkward — use a dedicated account.**
+A `401 - invalid content type` means the credentials were rejected. The
+underlying problem: signing into Windows with a PIN means there may be no
+usable account password, and Microsoft-account logins need odd username
+formats (`MicrosoftAccount\you@example.com`). The clean fix is a dedicated
+local admin account for automation:
+```powershell
+New-LocalUser -Name "hyperv" -Password (Read-Host -AsSecureString "Password")
+Add-LocalGroupMember -Group "Administrators" -Member "hyperv"
+```
+Administrators membership is what grants WinRM access (its default
+permissions allow Administrators and Remote Management Users) plus Hyper-V
+rights. This is also better practice than putting a personal login in a
+`.tfvars` file. To test a password without side effects:
+```powershell
+Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+$ctx = [System.DirectoryServices.AccountManagement.PrincipalContext]::new('Machine', $env:COMPUTERNAME)
+$ctx.ValidateCredentials('hyperv', '<password>')
+```
+
+**4. `oscdimg` receives quote characters literally — don't quote paths.**
+This one cost the most time, and the lesson generalizes: *when a tool fails
+in a way that makes no sense, test the tool directly instead of theorising
+about it.* Running `oscdimg` by hand three ways settled it immediately —
+unquoted paths built the ISO successfully, quoted paths reproduced the exact
+`Error 123` verbatim, and unquoted-over-an-existing-file overwrote cleanly.
+
+`local-exec` runs commands through `cmd /C`, and escaped quotes in the
+command string survive into `oscdimg`'s arguments as literal characters. A
+quote isn't a legal character in a Windows filename, so the tool reports
+`Error 123: The filename, directory name, or volume label syntax is
+incorrect`. The tell is in the error text: the path appears wrapped in
+*doubled* quotes, because the tool adds its own around an argument that
+already contains some. Since these paths contain no spaces, the fix is simply
+not to quote them.
+
+**5. Ignore the `UNC paths are not supported` warning.**
+Every `local-exec` run prints:
+```
+UNC paths are not supported.  Defaulting to Windows directory.
+```
+because `cmd.exe` refuses a UNC path as a working directory. It's noise — the
+successful ISO builds printed it too. As long as every path in the command is
+absolute, the working directory is irrelevant. (A `pushd`/`popd` workaround
+was attempted and abandoned; don't bother.)
+
+**6. Build artifacts belong on a Windows path.**
+`build_dir` is `C:/HyperV/build`, deliberately outside the repo. The decisive
+reason isn't tooling convenience: **Hyper-V cannot attach a DVD ISO from a
+`\\wsl.localhost\` path**, so the seed ISO must exist on a real Windows
+filesystem for the VM to mount it. Reading the `.tpl` *sources* from the repo
+over the share is fine — Terraform's own file I/O handles UNC paths.
+
+**7. The provider rewrites paths, which breaks Terraform's plan/apply contract.**
+```
+Provider produced inconsistent final plan ...
+was cty.StringVal("E:/Hyper-V/terraform/node1.vhdx"),
+but now cty.StringVal("E:\\Hyper-V\\terraform\\node1.vhdx")
+```
+Terraform guarantees that a value known at plan time comes back unchanged
+after apply. This provider silently normalises forward slashes to backslashes
+during apply, violating that. Terraform's own message calls it a provider bug,
+and it is.
+
+The workaround is to hand it backslashes up front so its normalisation is a
+no-op — that's what `replace(..., "/", "\\")` in the `locals` block is for.
+(Note `\\` in an HCL string is one literal backslash; `\` is an escape
+character.) Leaving forward slashes in place would also produce a permanent
+phantom diff on every future plan, since config and state would never agree.
+
+**8. Secure Boot rejects Ubuntu until you point it at the right CA.**
+A Gen 2 VM booting Ubuntu shows:
+```
+SCSI Disk (0,0)
+The signed image's hash is not allowed (DB)
+```
+Gen 2 VMs default to the `MicrosoftWindows` Secure Boot template, which only
+trusts Windows-signed bootloaders. Ubuntu's shim is signed by the **Microsoft
+UEFI Certificate Authority** — a different template. Setting
+`secure_boot_template = "MicrosoftUEFICertificateAuthority"` fixes it while
+keeping Secure Boot on; `enable_secure_boot = "Off"` also works but throws
+away the feature rather than configuring it.
+
+The other two lines on that boot summary (PXE "boot image was not found", DVD
+"boot loader did not load an operating system") are *correct* behaviour —
+there's no PXE server, and the seed ISO is a data disc with no bootloader.
+The `boot_order` block exists to skip the pointless PXE attempt.
+
+**9. `wait_for_ips = false`, and expect slowness regardless.**
+By default the provider blocks waiting for the VM to report an IP through
+Hyper-V integration services. That's pointless here, because the IP is
+statically assigned by cloud-init — there's nothing to discover — and it
+turns any boot problem into a 15-minute hang. Even healthy, this module is
+slow: the VHDX copy/grow takes ~2m30s and VM creation can sit at
+`Still creating...` for many minutes. Don't assume slow means broken.
+
 ## Where we are now
 
-- `versions.tf`, `variables.tf` — done.
-- `main.tf` — provider block, `hyperv_network_switch.main`, and all three
-  `local_file` resources are written and validated. Not yet written: the
-  `null_resource` + `oscdimg` block (builds the seed ISO from the rendered
-  `build/` files), the VHDX copy/grow, and the `hyperv_machine_instance`
-  resource that ties node identity + switch + disk + seed ISO together.
-- All three cloud-init files (`user-data.yaml.tpl`, `network-config.yaml.tpl`,
-  `ufw-setup.sh`) — done.
+`terraform apply -lock=false` completes: **7 added, 0 changed, 0 destroyed.**
+The VM runs, responds to ping at `192.168.50.178`, and answers on port 22 as
+Ubuntu 24.04.
 
-See `docs/resume.md` for the exact next task and the full up-to-date
-status.
+One problem remains open: **cloud-init did not install the SSH key**, so the
+VM is currently unreachable (key auth rejected, and no console password was
+ever set). The rendered `user-data`, the seed ISO contents, and the local
+keypair have all been verified correct, so the fault is somewhere inside the
+VM's cloud-init run rather than in anything Terraform produced.
+
+A lesson for next time that's worth carrying forward regardless of the cause:
+**always give a first-boot VM a break-glass console password** via cloud-init
+(`password:` plus `chpasswd: {expire: false}`, leaving `ssh_pwauth: false` so
+it stays console-only). Depending entirely on an SSH key that cloud-init
+itself has to install means a single cloud-init failure locks you out
+completely.
+
+See `docs/resume.md` for the exact diagnostic to run next and the full
+verified-already list, so none of that work gets repeated.

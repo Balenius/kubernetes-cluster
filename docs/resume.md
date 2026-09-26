@@ -171,6 +171,14 @@ WSL filesystem but are reached from PowerShell via the `\\wsl$\<Distro>\...`
 `*.tfstate` are already covered by the existing `.gitignore` from M0. This
 step touched nothing in Hyper-V yet — pure config/provider validation.
 
+**`variables.tf` changed further during the real `apply`** (full reasoning in
+the Windows/WSL gotchas section near the end of this file): `hyperv_host`
+`"localhost"` → `"127.0.0.1"`; `hyperv_winrm_port` `"5986"` → `"5985"`;
+`hyperv_winrm_https` `"true"` → `"false"`; `hyperv_user` `"balen"` →
+`"hyperv"` (a dedicated local admin account); trailing slash dropped from
+`vhd_destination_path` (it was producing `E:/Hyper-V/terraform//node1.vhdx`);
+and a new `build_dir` variable added, defaulting to `"C:/HyperV/build"`.
+
 ### 🔧 `terraform/hyperv/main.tf` — IN PROGRESS (started, not complete)
 
 So far, two pieces written and reviewed correct:
@@ -360,10 +368,9 @@ unrelated `local_file.meta-data` — renamed to `build_seed_iso`.
 
 ```hcl
 resource "hyperv_vhd" "boot_disk" {
-  path     = "${var.vhd_destination_path}/${var.node_name}.vhdx"
-  source   = var.ubuntu_vhdx_source
-  size     = var.disk_size_bytes
-  vhd_type = "Dynamic"
+  path   = local.boot_disk_path_win
+  source = var.ubuntu_vhdx_source
+  size   = var.disk_size_bytes
 }
 ```
 
@@ -373,6 +380,14 @@ needed because the VM can't write directly onto the shared base image
 (would corrupt it / block reuse for future VMs). Mistake fixed: `path`'s
 string was missing its closing `"`, leaving it unterminated.
 
+Two later changes made during the real `apply` (see the Windows/WSL gotchas
+section below for the full reasoning): **`vhd_type = "Dynamic"` was removed**
+(the provider declares it `ConflictsWith` `source` — a copy inherits its
+type from the source file, so it can't be independently set), and **`path`
+now takes a backslashed value** via `local.boot_disk_path_win` rather than
+the forward-slash interpolation, to stop the provider's silent path
+normalization from breaking the plan/apply contract.
+
 Also covered: the `${var.x}` vs bare `var.x` rule — bare (no quotes, no
 `${}`) when the whole argument value is just that one reference (`source`,
 `size`); `"${var.x}/${var.y}.ext"` interpolation only needed when mixing a
@@ -381,10 +396,10 @@ variable into a larger string with literal text.
 ### Rename note: `local_file.user_data` → `local_file.user-data`
 
 Not itself part of the plan — came up when standardizing naming style
-across the `local_file` resources. Real state is currently **empty** (no
-`apply` has been run against real Hyper-V yet), so this specific rename
-cost nothing. But covered as a concept for when it matters (e.g. once
-`hyperv_machine_instance` is real infrastructure): a resource's address
+across the `local_file` resources. State was empty at the time, so this
+specific rename cost nothing. (No longer true going forward: state now holds
+7 real resources, so any future rename needs the handling below.) Covered as
+a concept for when it matters: a resource's address
 (`type.name`) is its identity in `terraform.tfstate`; renaming it in config
 without telling Terraform makes the next plan show a destroy (old address)
 + create (new address) instead of an in-place rename — fine for a
@@ -426,24 +441,199 @@ for these (confirmed still correctly git-ignored via the existing
 `terraform.tfvars.example` has the same four keys with obvious placeholder
 values, committed.
 
-## Next task (exact pickup point)
+### ✅ `terraform/hyperv/main.tf` — `hyperv_machine_instance.hyperv_node` (DONE)
 
-The `hyperv_machine_instance` resource in `main.tf` — the one that actually
-creates the VM. Not yet explained in detail or started. Needs to tie
-together: `node_name`/`cpus`/`memory_bytes` (node identity/sizing),
-`hyperv_network_switch.main` (network), `hyperv_vhd.boot_disk` (boot disk),
-and `null_resource.build_seed_iso`'s output ISO (mounted as a DVD drive so
-cloud-init can read it on first boot). Its exact schema (e.g.
-`hard_disk_drives` block, `dvd_drives` block, `network_adaptors` block,
-`generation`) hasn't been looked up/taught yet — do that first when
-resuming, from the `taliesins/hyperv` provider docs, before handing it to
-the user as an exercise.
+The resource that actually creates the VM. Schema was looked up from the
+provider's docs first (it's large — most of its arguments are irrelevant
+here). The subset used:
 
-## What comes after this (per the plan, not started)
-- The `hyperv_machine_instance` resource (see above — this is the last
-  piece before a real `apply`).
-- `terraform apply` for real, against actual Hyper-V. Fetch the kubeconfig,
-  `kubectl get nodes` → `Ready`.
+- Top level: `name`, `generation = 2` (UEFI; Ubuntu 24.04 cloud images are
+  built for Gen 2), `processor_count`, `static_memory = true` +
+  `memory_startup_bytes` (simpler than the dynamic-memory min/max mode, and
+  right for a fixed-size home-lab VM).
+- `network_adaptors { }` — `name`, `switch_name =
+  hyperv_network_switch.main.name`, and `wait_for_ips = false` (see gotchas).
+- `hard_disk_drives { }` — `controller_type = "Scsi"` (Gen 2 VMs have no IDE
+  controllers), `controller_number = 0`, `controller_location = 0`, `path =
+  hyperv_vhd.boot_disk.path`. **Keep that reference rather than reusing the
+  local** — it's what gives Terraform the implicit "VM waits for disk"
+  dependency.
+- `dvd_drives { }` — `controller_number = 0`, `controller_location = 1` (the
+  disk already holds location 0 on the same controller), `path` pointing at
+  the seed ISO.
+- `vm_firmware { }` — Secure Boot config plus a `boot_order` block (see
+  gotchas).
+- `depends_on = [null_resource.build_seed_iso]` — needed because
+  `null_resource` exposes no attribute to reference, so there'd otherwise be
+  no dependency edge telling Terraform to build the ISO before the VM.
+
+Mistakes caught: all three nested blocks were first written as YAML-style
+lists (`- key = value`) — the same reflex that hit `triggers` earlier; block
+bodies are plain `key = value` pairs. Also `nic0` unquoted (bare words are
+identifier lookups, not strings) and `static memory = true` (space instead
+of underscore, making it two identifiers).
+
+## 🔑 Windows/WSL/provider gotchas hit during the real `apply`
+
+This module's "likely rough patch" warning was earned. Everything below cost
+real debugging time — read this section before touching Terraform here again.
+
+1. **State locking fails over the WSL share.** `Error acquiring the state
+   lock ... Incorrect function.` Terraform's local backend uses a Windows
+   file-locking syscall the `\\wsl.localhost\` 9P filesystem doesn't
+   implement. **Every command in this module needs `-lock=false`**
+   (`terraform plan -lock=false`, `terraform apply -lock=false`). Safe here:
+   single user, local state, no concurrent runs.
+
+2. **WinRM port/protocol mismatch.** `variables.tf` originally said port
+   `5986` + `https = true`, but the host prep only ever created the **HTTP**
+   listener on **5985** (an HTTPS listener needs a certificate, never set
+   up). Symptom: `dial tcp [::1]:5986 ... actively refused`. Fixed to
+   `hyperv_winrm_port = "5985"`, `hyperv_winrm_https = "false"`. Also
+   changed `hyperv_host` from `"localhost"` to **`"127.0.0.1"`** — `localhost`
+   resolved to IPv6 `[::1]`, but the hardened firewall rule is scoped to the
+   IPv4 literal. Diagnostic: `winrm enumerate winrm/config/listener`.
+
+3. **WinRM auth (401).** Next symptom was `401 - invalid content type`.
+   Root cause: the user signs into Windows with Windows Hello (PIN), so
+   there was no usable account password for WinRM. **Resolved by creating a
+   dedicated local admin account** — `hyperv_user` is now `"hyperv"` (was
+   `"balen"`), with its password in `terraform.tfvars`. Better practice than
+   embedding a personal login anyway. Useful diagnostics if this recurs:
+   `Get-LocalUser | Select Name, PrincipalSource` (shows `Local` vs
+   `MicrosoftAccount`), and validating a password without side effects:
+   ```powershell
+   Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+   $ctx = [System.DirectoryServices.AccountManagement.PrincipalContext]::new('Machine', $env:COMPUTERNAME)
+   $ctx.ValidateCredentials('hyperv', '<password>')
+   ```
+
+4. **`oscdimg` takes quotes literally — VERIFIED EMPIRICALLY.** This one ate
+   the most time. `local-exec` runs via `cmd /C`, and escaped quotes in the
+   command string survive into `oscdimg`'s arguments as literal characters;
+   quotes aren't legal in Windows filenames, hence
+   `Error 123: The filename, directory name, or volume label syntax is
+   incorrect`. Tested directly, three runs: unquoted paths → **exit 0, ISO
+   built**; quoted paths → **reproduced the error verbatim**; unquoted with
+   the ISO already present → **exit 0, clean overwrite**. So: **no quotes in
+   the command**, which is fine because the paths have no spaces.
+   ```hcl
+   command = "${var.iso_tool} -n -m -lcidata ${local.build_dir_win} ${local.build_dir_win}\\seed.iso"
+   ```
+
+5. **The `UNC paths are not supported. Defaulting to Windows directory.`
+   warning is harmless noise.** It prints on every `local-exec` run because
+   `cmd.exe` can't use a UNC path as its working directory — but the
+   successful oscdimg runs printed it too. As long as paths are absolute, it
+   doesn't matter. (Mid-session this was wrongly treated as fatal, and a
+   `pushd`/`popd` workaround was tried and abandoned — don't go down that
+   road again.)
+
+6. **Build output must live on a native Windows path.** `build_dir` is now
+   `C:/HyperV/build`, not a directory inside the repo. Two reasons: the
+   legacy toolchain is happier, and more importantly **Hyper-V cannot attach
+   a DVD ISO from `\\wsl.localhost\...`** — the seed ISO has to be on a real
+   Windows filesystem for the VM to mount it. The `.tpl` *source* paths still
+   use `${path.module}/../../cloud-init/...` (reading from the repo over the
+   WSL share is fine — Terraform's own file I/O handles UNC).
+
+7. **`vhd_type` conflicts with `source`.** Provider schema declares them
+   mutually exclusive — a copied VHD inherits its type from the source file.
+   Removed.
+
+8. **Provider path normalization breaks the plan/apply contract.** Error:
+   `Provider produced inconsistent final plan ... was "E:/Hyper-V/..." but
+   now "E:\\Hyper-V\\..."`. The provider silently rewrites forward slashes to
+   backslashes during apply, so the value Terraform was promised at plan time
+   isn't what came back. Terraform calls this "a bug in the provider" and it
+   is. **Fix: feed it backslashes from the start** so normalization is a
+   no-op — hence `local.boot_disk_path_win` / `local.build_dir_win` and the
+   `replace(..., "/", "\\")` pattern. Leaving forward slashes would also
+   cause a permanent phantom diff on every future plan.
+
+9. **Secure Boot rejects Ubuntu by default.** VM booted to
+   `The signed image's hash is not allowed (DB)` on the SCSI disk. Gen 2 VMs
+   default to the `MicrosoftWindows` Secure Boot template, which only trusts
+   Windows-signed bootloaders; Ubuntu's shim is signed by the Microsoft UEFI
+   CA. Fix:
+   ```hcl
+   vm_firmware {
+     enable_secure_boot   = "On"
+     secure_boot_template = "MicrosoftUEFICertificateAuthority"
+   }
+   ```
+   (`enable_secure_boot = "Off"` also works but is the blunter option.) A
+   `boot_order` block with `boot_type = "HardDiskDrive"` was added in the
+   same place to skip the pointless PXE attempt on every boot.
+
+10. **`wait_for_ips = false`.** The provider otherwise blocks waiting for the
+    VM to report an IP via Hyper-V integration services. Pointless here — the
+    IP is statically assigned by cloud-init, so there's nothing to discover —
+    and it turns any boot problem into a very long hang.
+
+11. **Apply is slow even when healthy.** The VHDX copy/grow alone took
+    ~2m30s, and `hyperv_machine_instance` sat at `Still creating...` for
+    ~15 minutes before eventually succeeding. Don't assume a hang is a
+    failure too early.
+
+**Final result: `Apply complete! Resources: 7 added, 0 changed, 0 destroyed.`**
+The VM is running, reachable at `192.168.50.178` (ping ~0.4ms), SSH port
+open, and identifies as Ubuntu 24.04 (`OpenSSH_9.6p1 Ubuntu-3ubuntu13.19`).
+
+## Next task (exact pickup point) — 🔴 BLOCKED: cloud-init didn't apply user-data
+
+**The VM boots and is reachable, but SSH key auth is rejected for every
+username tried (`ubuntu`, `root`, `balenius`, `node1`) — the server offers
+only `publickey`, and the key isn't installed. There is currently no way
+into the VM: no SSH key, and no console password was ever set.**
+
+Everything on the build side has already been verified correct — **don't
+re-do this work**:
+
+- `C:\HyperV\build\user-data` renders correctly: valid YAML, `#cloud-config`
+  as the exact first line, **no BOM, no CRLF**, the SSH key present verbatim,
+  all four expected top-level keys (`hostname`, `ssh_authorized_keys`,
+  `write_files`, `runcmd`). The fiddly `${indent(6, ufw_setup_script)}` came
+  out correctly indented.
+- `~/.ssh/id_ed25519.pub` is **byte-identical** to `ssh_authorized_key` in
+  `terraform.tfvars`.
+- `seed.iso` was parsed at the ISO9660 level: volume label **`CIDATA`**,
+  contains `USER-DATA` (616 b), `META-DATA` (41 b), `NETWORK-CONFIG` (238 b)
+  with correct content. Names are uppercase with **no Joliet and no Rock
+  Ridge** extensions — Linux's isofs driver lowercases bare ISO9660 names by
+  default, so cloud-init *should* still match them, but this remains the one
+  unverified assumption in the chain and is worth confirming.
+- The DVD is genuinely attached — the earlier failed boot summary listed
+  `SCSI DVD (0,1)` as a boot candidate.
+
+**The one cheap diagnostic not yet run: what hostname does the Hyper-V
+console login prompt show?**
+- `node1 login:` → cloud-init *did* read the seed (that hostname can only
+  come from `meta-data`/`user-data`), so the datasource works and the problem
+  is narrower — something in the SSH module or the default-user assumption.
+- `ubuntu login:` → cloud-init never processed the seed at all. That would
+  also mean the static IP didn't come from `network-config`, making
+  `192.168.50.178` a DHCP lease — note the router DHCP reservation/exclusion
+  flagged earlier in this file **was never actually done**, so the pool may
+  well include `.178`.
+
+Likely follow-ups once that's known:
+- Getting *into* the locked-out VM: boot to GRUB and add `init=/bin/bash` to
+  the kernel line for a root shell, then read `/var/log/cloud-init.log` and
+  `cloud-init status --long`. That log is the authoritative answer.
+- **Add a break-glass console password to `user-data.yaml.tpl`** so a future
+  first boot is never a lockout: top-level `password:`, `chpasswd: {expire:
+  false}`, and leave `ssh_pwauth: false` so it's console-only. Should have
+  been there from the start for a VM being brought up for the first time.
+- If the ISO naming turns out to be the culprit, rebuild with Joliet
+  (`oscdimg -j1 ...`) or switch ISO tools.
+
+## What comes after this (once the VM is reachable)
+- Confirm cloud-init finished (`cloud-init status`) and that `runcmd`
+  actually installed k3s (`systemctl is-active k3s`).
+- Fetch the kubeconfig from `/etc/rancher/k3s/k3s.yaml`, rewrite its
+  `server:` address from `127.0.0.1` to `192.168.50.178`, and verify
+  `kubectl get nodes` → one `Ready` node from the WSL side.
 - Then M4 (raw Kubernetes manifests) → M5 (Kustomize) → M6 (Argo CD) → M7
   (GitHub Actions CI/CD) → M8 (Pi/AWS portability, scaffolded only).
 
@@ -463,14 +653,14 @@ so the door isn't closed, just out of scope for this build. Would need
 - `00-orientation.md` — the big picture / two-layer architecture / build order.
 - `01-docker.md` — Docker concepts + both Dockerfiles (backend, frontend/nginx).
 - `02-docker-compose.md` — Compose concepts + the three-service file.
-- `03-terraform-hyperv.md` — IaC/Terraform/cloud-init concepts + the 6-item
-  host prep checklist, plus (backfilled this session) the `variables.tf`,
-  `main.tf` (provider/switch/`local_file`), and cloud-init file lessons.
-  Still not caught up as of this resume: `null_resource`, `hyperv_vhd`,
-  `outputs.tf`, `.tfvars`, and the rename/`moved`-block detour (all done in
-  code, only in this resume file's notes above, not yet written into the
-  doc's prose) — backfill those next time doc-writing comes up, or continue
-  the exercise first and catch the doc up when there's a natural pause.
+- `03-terraform-hyperv.md` — **now fully caught up with the code.** Covers
+  IaC/Terraform/cloud-init concepts, the 6-item host prep checklist,
+  `variables.tf`, the whole of `main.tf` (provider, switch, `local_file`s,
+  `null_resource`/`oscdimg`, `locals`, `hyperv_vhd`,
+  `hyperv_machine_instance`), the cloud-init files, and a long
+  "Windows, WSL, and a community provider" section documenting all nine
+  environment problems hit during the real `apply`. That last section is the
+  one to re-read before rebuilding this module anywhere.
 - `resume.md` — this file.
 
 ## Misc environment notes
