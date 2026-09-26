@@ -40,6 +40,7 @@ resource "local_file" "meta-data" {
 
 locals {
   build_dir_win = replace(var.build_dir, "/", "\\")
+  boot_disk_path_win = replace("${var.vhd_destination_path}/${var.node_name}.vhdx", "/", "\\")
 }
 
 resource "null_resource" "build_seed_iso" {
@@ -54,7 +55,7 @@ resource "null_resource" "build_seed_iso" {
 }
 
 resource "hyperv_vhd" "boot_disk" {
-  path = "${var.vhd_destination_path}/${var.node_name}.vhdx"
+  path = local.boot_disk_path_win
   source = var.ubuntu_vhdx_source
   size = var.disk_size_bytes
 }
@@ -68,6 +69,7 @@ resource "hyperv_machine_instance" "hyperv_node" {
   network_adaptors {
     name = "nic0"
     switch_name = hyperv_network_switch.main.name
+    wait_for_ips = false
   }
   hard_disk_drives {
     controller_type = "Scsi"
@@ -79,6 +81,15 @@ resource "hyperv_machine_instance" "hyperv_node" {
     controller_number = 0
     controller_location = 1
     path = "${var.build_dir}/seed.iso"
+  }
+  vm_firmware {
+    enable_secure_boot   = "On"
+    secure_boot_template = "MicrosoftUEFICertificateAuthority"
+    boot_order {
+      boot_type           = "HardDiskDrive"
+      controller_number   = 0
+      controller_location = 0
+    }
   }
   depends_on = [null_resource.build_seed_iso]
 }
