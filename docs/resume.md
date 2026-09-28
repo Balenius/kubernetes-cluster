@@ -666,10 +666,14 @@ file is full cluster-admin credentials; it lives outside the repo.
   (`sensitive = true`) wired through `variables.tf` → `terraform.tfvars` /
   `terraform.tfvars.example` → `main.tf`'s `templatefile()` call →
   `user-data.yaml.tpl` (`password:` / `chpasswd: {expire: false}` /
-  `ssh_pwauth: false`, siblings of `hostname:`). Confirmed via
+  `ssh_pwauth: false`, siblings of `hostname:`). **Not yet verified:** that
   `terraform plan -lock=false | Select-String password` (PowerShell, not
-  `grep`) that both `console_password` and `hyperv_password` show as
-  `(sensitive value)`, never in plaintext.
+  `grep`) shows it as `(sensitive value)` — the check was suggested but never
+  run. **Verified 2026-09-28:** `sensitive` only redacts CLI output — the
+  password *is* in plaintext in `terraform.tfstate` and in the rendered
+  `C:\HyperV\build\user-data` (and therefore the seed ISO). Both are outside
+  git (`*.tfstate` gitignored; build dir is off-repo), which is what actually
+  protects it. On the VM, cloud-init stores it hashed in `/etc/shadow`.
   **Still to actually confirm at the console** (not blocking, just not done
   yet): log into the Hyper-V console with this password, and separately
   confirm `ssh -o PreferredAuthentications=password ubuntu@...` still gets
@@ -695,17 +699,43 @@ file is full cluster-admin credentials; it lives outside the repo.
 - ✅ `docs/03-terraform-hyperv.md` updated with the ufw syntax fix, the CIDR
   rules, and the passphrase/BatchMode lesson (as gotcha #10).
 
-## Next task (exact pickup point) — M4: raw Kubernetes manifests
-Per the master plan: namespace → Postgres StatefulSet + headless Service +
-PVC + schema ConfigMap → backend Deployment/Service (env from Secret, health
-probes) → frontend Deployment/Service → Traefik Ingress (`rps.local`).
-`game-db` Secret created with `kubectl`, kept out of git.
+## Next task (exact pickup point) — M4, Step 0 (not started yet)
 
-**First question to settle in M4:** how the cluster gets the app images.
-They're built locally by Docker in WSL; the node can't see those. GHCR
-publishing is M7. Options for now: push to GHCR by hand, or
-`docker save` → `ssh` → `sudo k3s ctr images import -` onto the node (with
-`imagePullPolicy: IfNotPresent`/`Never`).
+**Open [`docs/04-kubernetes-manifests.md`](./04-kubernetes-manifests.md) and
+start at "Step 0: get the images onto the node".** That doc is the M4 lesson:
+concepts, a Compose→Kubernetes mapping table, and a per-file spec for every
+manifest (what it must contain, the gotchas specific to *this* app, and the
+exact verify command). **No YAML has been written yet**. The user writes each
+file; Claude reviews. The progress table at the bottom of doc 04 tracks
+which steps are done.
+
+Decisions already made (don't re-litigate):
+- **Images:** tag `:m4` (not `:latest`, which forces `imagePullPolicy:
+  Always` → Docker Hub → `ImagePullBackOff`), then
+  `docker save ... | ssh ubuntu@192.168.50.178 'sudo k3s ctr images import -'`.
+  GHCR comes in M7. Must be repeated after any Terraform rebuild.
+- **Files live in `apps/game-project/`** (flat). M5 moves them to `base/`.
+- **Namespace `rps`.** Secret `game-db` (keys `POSTGRES_USER`,
+  `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`) created with `kubectl`,
+  never in a file. New password, not `testdb123`.
+- **Service names are fixed by the app:** `backend` port 8000 (hard-coded in
+  `frontend/nginx.conf`), `postgres` port 5432 (host in `DATABASE_URL`).
+- Backend liveness probe = **TCP socket**, not `/api/health` (that endpoint
+  checks the DB, so a DB blip would restart every backend). Readiness =
+  `/api/health`.
+- Browser runs on Windows → `rps.local` goes in
+  `C:\Windows\System32\drivers\etc\hosts`.
+
+Facts verified 2026-09-28 while preparing M4 (don't re-check):
+- Local images present: `game-project-backend:latest`,
+  `game-project-frontend:latest` (x86_64, matches the node).
+- `backend/app/db.py` reads `os.environ["DATABASE_URL"]`; `/api/health`
+  runs `SELECT 1`; nginx proxies `/api/` → `http://backend:8000/api/`.
+- Traefik is already running in `kube-system` (k3s default) and holds port 80.
+
+**Session-start reminders:** SSH needs your key passphrase (no agent);
+anything run with `BatchMode=yes` will fail with a misleading
+`Permission denied`. `kubectl` in WSL works without `sudo`.
 
 Then M5 (Kustomize) → M6 (Argo CD) → M7 (GitHub Actions CI/CD) → M8 (Pi/AWS
 portability, scaffolded only).
@@ -726,14 +756,18 @@ so the door isn't closed, just out of scope for this build. Would need
 - `00-orientation.md` — the big picture / two-layer architecture / build order.
 - `01-docker.md` — Docker concepts + both Dockerfiles (backend, frontend/nginx).
 - `02-docker-compose.md` — Compose concepts + the three-service file.
-- `03-terraform-hyperv.md` — **caught up through the 2026-09-24 apply** (not yet: the ufw fix and the passphrase/BatchMode lesson from 2026-09-28 — see "Open M3 loose ends").** Covers
+- `03-terraform-hyperv.md` — **fully caught up (2026-09-28)**, including
+  the ufw fix/CIDR rules and gotcha #10 (passphrase + BatchMode). Covers
   IaC/Terraform/cloud-init concepts, the 6-item host prep checklist,
   `variables.tf`, the whole of `main.tf` (provider, switch, `local_file`s,
   `null_resource`/`oscdimg`, `locals`, `hyperv_vhd`,
   `hyperv_machine_instance`), the cloud-init files, and a long
-  "Windows, WSL, and a community provider" section documenting all nine
+  "Windows, WSL, and a community provider" section documenting the ten
   environment problems hit during the real `apply`. That last section is the
   one to re-read before rebuilding this module anywhere.
+- `04-kubernetes-manifests.md` — **M4 lesson, written ahead of the work.**
+  Concepts, Compose→k8s mapping, step-by-step file specs (Step 0 images →
+  6 Ingress), module verify, and a progress table to tick off.
 - `resume.md` — this file.
 
 ## Misc environment notes
