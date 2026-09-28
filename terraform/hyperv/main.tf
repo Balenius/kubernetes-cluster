@@ -17,6 +17,7 @@ resource "local_file" "user-data" {
   filename = "${var.build_dir}/user-data"
   content  = templatefile("${path.module}/../../cloud-init/user-data.yaml.tpl", {
     node_name = var.node_name
+    console_password = var.console_password
     ssh_authorized_key = var.ssh_authorized_key
     k3s_version = var.k3s_version
     ufw_setup_script = file("${path.module}/../../cloud-init/ufw-setup.sh")

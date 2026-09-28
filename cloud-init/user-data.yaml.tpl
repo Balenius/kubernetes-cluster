@@ -1,5 +1,9 @@
 #cloud-config
 hostname: ${node_name}
+password: ${console_password}
+chpasswd:
+  expire: false
+ssh_pwauth: false
 ssh_authorized_keys:
     - ${ssh_authorized_key}
 write_files:

@@ -81,7 +81,10 @@ vs `*.tfvars`, `!exception` ordering), pushed to GitHub.
 - Committed as three focused commits (frontend/nginx, backend/CORS, compose)
   and pushed.
 
-### 🔧 M3 — Terraform + cloud-init → k3s on Hyper-V (IN PROGRESS)
+### ✅ M3 — Terraform + cloud-init → k3s on Hyper-V (DONE 2026-09-28)
+`kubectl get nodes` from WSL → `node1 Ready control-plane,master
+v1.31.5+k3s1`. Firewall active and verified with the cluster running. See
+"M3 wrap-up" further down for how it finished, including the false lockout.
 This is the flagged "likely rough patch" module (community-maintained
 `taliesins/hyperv` Terraform provider). **Environment prep is fully done —
 no fallback needed, proceeding with real Terraform.**
@@ -179,7 +182,7 @@ the Windows/WSL gotchas section near the end of this file): `hyperv_host`
 `vhd_destination_path` (it was producing `E:/Hyper-V/terraform//node1.vhdx`);
 and a new `build_dir` variable added, defaulting to `"C:/HyperV/build"`.
 
-### 🔧 `terraform/hyperv/main.tf` — IN PROGRESS (started, not complete)
+### ✅ `terraform/hyperv/main.tf` — DONE (see the resource-by-resource entries below)
 
 So far, two pieces written and reviewed correct:
 
@@ -237,7 +240,36 @@ server — what lets `kubectl` from outside the VM talk to the cluster), `80`
 now (plan is LAN-only, no TLS yet). Enabled non-interactively via
 `ufw enable --force` (cloud-init has no human to answer prompts).
 
-Mistakes caught and fixed: `-force` (single dash, gets parsed as bundled
+**⚠️ Superseded on 2026-09-28 — the version described above never worked.**
+On first boot every line except the two `default` policies failed, silently:
+`ufw allow 80 proto tcp` mixes ufw's simple syntax (`80/tcp`) with its full
+syntax (`proto tcp ... port 80`) → `ERROR: Wrong number of arguments` ×3;
+and `ufw enable --force` → `Invalid syntax` (`--force` is a global flag and
+must come *before* the command). No `set -e`, so the script carried on and
+cloud-init reported `done`. Found via `/var/log/cloud-init-output.log`;
+`sudo ufw show added` confirms which rules actually stuck (works while ufw is
+inactive). Current version:
+- `set -e` so the first failure stops the script and surfaces in
+  `cloud-init status`.
+- `ufw allow 80/tcp` / `6443/tcp` / `22/tcp` with comments.
+- **New:** `ufw allow from 10.42.0.0/16 to any` (pod CIDR) and
+  `ufw allow from 10.43.0.0/16 to any` (service CIDR). Without these,
+  default-deny-incoming blocks k3s's own in-cluster traffic (CoreDNS etc.) —
+  the broken script was only harmless *because* it never enabled ufw. These
+  don't widen LAN exposure: nothing on the LAN has a 10.42/10.43 address.
+- `ufw --force enable` last.
+- Run as root by cloud-init — no `sudo` inside the script.
+
+Verified on the live VM (applied by hand via `scp` + `sudo bash`): ufw
+`Status: active` with all 5 rules; all kube-system pods Running, 0 restarts;
+in-cluster DNS works (`nslookup kubernetes.default.svc.cluster.local` from a
+busybox pod — **use the FQDN**: busybox's `nslookup` ignores resolv.conf
+search domains, so the short name gives a misleading `NXDOMAIN` even though
+DNS is fine); external DNS from a pod works (`nslookup google.com`), which
+also proves ufw's `deny (routed)` default doesn't break pod egress — flannel's
+own forward rules cover it.
+
+Earlier mistakes caught and fixed: `-force` (single dash, gets parsed as bundled
 short flags, not the long-form flag) → `--force`; missing shebang line
 (`#!/bin/bash`) added; file was briefly named `ufw.sh` before being renamed
 to match the plan's `ufw-setup.sh` (old file confirmed not left behind).
@@ -580,15 +612,37 @@ real debugging time — read this section before touching Terraform here again.
 The VM is running, reachable at `192.168.50.178` (ping ~0.4ms), SSH port
 open, and identifies as Ubuntu 24.04 (`OpenSSH_9.6p1 Ubuntu-3ubuntu13.19`).
 
-## Next task (exact pickup point) — 🔴 BLOCKED: cloud-init didn't apply user-data
+## M3 wrap-up — the "lockout" that wasn't (resolved 2026-09-28)
 
-**The VM boots and is reachable, but SSH key auth is rejected for every
-username tried (`ubuntu`, `root`, `balenius`, `node1`) — the server offers
-only `publickey`, and the key isn't installed. There is currently no way
-into the VM: no SSH key, and no console password was ever set.**
+**cloud-init worked all along.** The earlier conclusion that the SSH key
+wasn't installed was wrong. `ssh -v` shows `Server accepts key:
+~/.ssh/id_ed25519` — the key *was* in `authorized_keys`. The real cause:
+**`~/.ssh/id_ed25519` has a passphrase**, and the diagnostic SSH attempts
+used `-o BatchMode=yes`, which can't prompt for it. SSH then fails to sign
+and reports a generic `Permission denied (publickey)` — indistinguishable
+from "key not installed" unless you read `-v` output. No ssh-agent is running
+in WSL, so nothing had the key unlocked. **Lesson: when publickey auth
+fails, run `ssh -v` and look for `Server accepts key` before suspecting the
+server side.** Just run `ssh ubuntu@192.168.50.178` interactively.
 
-Everything on the build side has already been verified correct — **don't
-re-do this work**:
+Confirmed from inside: console prompt showed `node1 login:` (seed read),
+`cloud-init status --long` → done, `systemctl is-active k3s` → active. So
+the uppercase-ISO9660-names assumption below is confirmed fine, and
+`192.168.50.178` does come from `network-config`, not DHCP.
+
+The one real bug surfaced during verification was `ufw-setup.sh` — see its
+entry above (never enabled; fixed and verified).
+
+**kubeconfig (done):** `kubectl` v1.31 installed in WSL at
+`/usr/local/bin/kubectl`. Kubeconfig copied from `/etc/rancher/k3s/k3s.yaml`
+(root-only on the node, `0600`) to `~/.kube/config`, `server:` changed to
+`https://192.168.50.178:6443`. Gotcha hit: the file ended up **root-owned**
+from using `sudo` in WSL → `sudo kubectl` reads `/root/.kube/config` (absent)
+and falls back to `localhost:8080`; plain `kubectl` got `permission denied`.
+Fixed with `chown balenius:balenius` — **never `sudo kubectl` in WSL.** This
+file is full cluster-admin credentials; it lives outside the repo.
+
+### Historical: the build-side checks done while "blocked" (all still true)
 
 - `C:\HyperV\build\user-data` renders correctly: valid YAML, `#cloud-config`
   as the exact first line, **no BOM, no CRLF**, the SSH key present verbatim,
@@ -606,36 +660,55 @@ re-do this work**:
 - The DVD is genuinely attached — the earlier failed boot summary listed
   `SCSI DVD (0,1)` as a boot candidate.
 
-**The one cheap diagnostic not yet run: what hostname does the Hyper-V
-console login prompt show?**
-- `node1 login:` → cloud-init *did* read the seed (that hostname can only
-  come from `meta-data`/`user-data`), so the datasource works and the problem
-  is narrower — something in the SSH module or the default-user assumption.
-- `ubuntu login:` → cloud-init never processed the seed at all. That would
-  also mean the static IP didn't come from `network-config`, making
-  `192.168.50.178` a DHCP lease — note the router DHCP reservation/exclusion
-  flagged earlier in this file **was never actually done**, so the pool may
-  well include `.178`.
+## Open M3 loose ends — resolved 2026-09-28
 
-Likely follow-ups once that's known:
-- Getting *into* the locked-out VM: boot to GRUB and add `init=/bin/bash` to
-  the kernel line for a root shell, then read `/var/log/cloud-init.log` and
-  `cloud-init status --long`. That log is the authoritative answer.
-- **Add a break-glass console password to `user-data.yaml.tpl`** so a future
-  first boot is never a lockout: top-level `password:`, `chpasswd: {expire:
-  false}`, and leave `ssh_pwauth: false` so it's console-only. Should have
-  been there from the start for a VM being brought up for the first time.
-- If the ISO naming turns out to be the culprit, rebuild with Joliet
-  (`oscdimg -j1 ...`) or switch ISO tools.
+- ✅ **Break-glass console password** — done. New `console_password` variable
+  (`sensitive = true`) wired through `variables.tf` → `terraform.tfvars` /
+  `terraform.tfvars.example` → `main.tf`'s `templatefile()` call →
+  `user-data.yaml.tpl` (`password:` / `chpasswd: {expire: false}` /
+  `ssh_pwauth: false`, siblings of `hostname:`). Confirmed via
+  `terraform plan -lock=false | Select-String password` (PowerShell, not
+  `grep`) that both `console_password` and `hyperv_password` show as
+  `(sensitive value)`, never in plaintext.
+  **Still to actually confirm at the console** (not blocking, just not done
+  yet): log into the Hyper-V console with this password, and separately
+  confirm `ssh -o PreferredAuthentications=password ubuntu@...` still gets
+  refused — proves `ssh_pwauth: false` is doing its job.
+- ✅ **Full `destroy` + `apply` rebuild** — done, unattended, no manual steps.
+  `cloud-init status --long` → `done`, `systemctl is-active k3s` → `active`,
+  `sudo ufw status verbose` → active with all 5 rules present **on first
+  boot** (previously these had to be applied by hand via `scp`). This is the
+  real proof the `ufw-setup.sh` fix works from a clean start, not just when
+  patched onto an already-running VM.
+  **New gotcha hit during this rebuild:** `ssh` refused the new VM with
+  `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` — expected, not a bug.
+  A `destroy`/`apply` is a brand-new VM (new SSH host key, new k3s cluster
+  CA), reusing the same static IP. Fix each time this happens:
+  `ssh-keygen -f ~/.ssh/known_hosts -R 192.168.50.178` before reconnecting.
+  Same reasoning applies to the kubeconfig — `kubectl get nodes` failed with
+  `x509: certificate signed by unknown authority` until the kubeconfig was
+  re-fetched from the new VM (new cluster CA, old file pinned the old one).
+  Re-verified after rebuild: `node1 Ready control-plane,master v1.31.5+k3s1`,
+  `AGE 8m40s` confirming it's genuinely the new cluster.
+- **Router DHCP reservation/exclusion for `.178`** — decided not needed, not
+  doing this.
+- ✅ `docs/03-terraform-hyperv.md` updated with the ufw syntax fix, the CIDR
+  rules, and the passphrase/BatchMode lesson (as gotcha #10).
 
-## What comes after this (once the VM is reachable)
-- Confirm cloud-init finished (`cloud-init status`) and that `runcmd`
-  actually installed k3s (`systemctl is-active k3s`).
-- Fetch the kubeconfig from `/etc/rancher/k3s/k3s.yaml`, rewrite its
-  `server:` address from `127.0.0.1` to `192.168.50.178`, and verify
-  `kubectl get nodes` → one `Ready` node from the WSL side.
-- Then M4 (raw Kubernetes manifests) → M5 (Kustomize) → M6 (Argo CD) → M7
-  (GitHub Actions CI/CD) → M8 (Pi/AWS portability, scaffolded only).
+## Next task (exact pickup point) — M4: raw Kubernetes manifests
+Per the master plan: namespace → Postgres StatefulSet + headless Service +
+PVC + schema ConfigMap → backend Deployment/Service (env from Secret, health
+probes) → frontend Deployment/Service → Traefik Ingress (`rps.local`).
+`game-db` Secret created with `kubectl`, kept out of git.
+
+**First question to settle in M4:** how the cluster gets the app images.
+They're built locally by Docker in WSL; the node can't see those. GHCR
+publishing is M7. Options for now: push to GHCR by hand, or
+`docker save` → `ssh` → `sudo k3s ctr images import -` onto the node (with
+`imagePullPolicy: IfNotPresent`/`Never`).
+
+Then M5 (Kustomize) → M6 (Argo CD) → M7 (GitHub Actions CI/CD) → M8 (Pi/AWS
+portability, scaffolded only).
 
 ## Design notes (asked and answered along the way)
 
@@ -653,7 +726,7 @@ so the door isn't closed, just out of scope for this build. Would need
 - `00-orientation.md` — the big picture / two-layer architecture / build order.
 - `01-docker.md` — Docker concepts + both Dockerfiles (backend, frontend/nginx).
 - `02-docker-compose.md` — Compose concepts + the three-service file.
-- `03-terraform-hyperv.md` — **now fully caught up with the code.** Covers
+- `03-terraform-hyperv.md` — **caught up through the 2026-09-24 apply** (not yet: the ufw fix and the passphrase/BatchMode lesson from 2026-09-28 — see "Open M3 loose ends").** Covers
   IaC/Terraform/cloud-init concepts, the 6-item host prep checklist,
   `variables.tf`, the whole of `main.tf` (provider, switch, `local_file`s,
   `null_resource`/`oscdimg`, `locals`, `hyperv_vhd`,

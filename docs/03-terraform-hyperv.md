@@ -263,22 +263,50 @@ on its own line — content can't start on the same line as the `|`.
 
 ```bash
 #!/bin/bash
+set -e
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 80 proto tcp comment "HTTP"
-ufw allow 6443 proto tcp comment "Kubernetes API Server"
-ufw allow 22 proto tcp comment "SSH"
-ufw enable --force
+ufw allow 80/tcp comment "HTTP"
+ufw allow 6443/tcp comment "Kubernetes API Server"
+ufw allow 22/tcp comment "SSH"
+ufw allow from 10.42.0.0/16 to any comment "Kubernetes Cluster Network"
+ufw allow from 10.43.0.0/16 to any comment "Kubernetes Cluster Network"
+ufw --force enable
 ```
 Plain bash, not templated — no `${...}` vars needed. Default-deny-incoming
-model, then explicit allows for exactly the three ports this build needs:
-`22` (SSH — without it the VM is unreachable), `6443` (the Kubernetes API
-server — what lets `kubectl` from outside the VM talk to the cluster), and
-`80` (HTTP, for Traefik ingress once M4 adds one). `443` is deliberately
-skipped for now — this build is LAN-only, no TLS yet. `ufw enable --force`
-(not `-force`, which parses as bundled short flags) is needed because
-cloud-init has no human around to answer the interactive confirmation
-prompt.
+model, then explicit allows for the ports this build needs: `22` (SSH —
+without it the VM is unreachable), `6443` (the Kubernetes API server — what
+lets `kubectl` from outside the VM talk to the cluster), and `80` (HTTP, for
+Traefik ingress once M4 adds one). `443` is deliberately skipped for now —
+this build is LAN-only, no TLS yet.
+
+**This is the second version of this script — the first one silently did
+nothing.** `ufw` has two rule syntaxes and mixing them fails:
+`80/tcp` (protocol attached to the port with a slash) or
+`proto tcp from any to any port 80` (explicit keywords, strict order) — not
+`80 proto tcp`, which was the original mistake and gives
+`ERROR: Wrong number of arguments`. Likewise `--force` is a *global* flag and
+has to come before the command — `ufw --force enable`, not
+`ufw enable --force`, which gives `Invalid syntax`. Without `set -e`, none of
+that stopped the script: cloud-init happily reported `runcmd` as done while
+every rule except the two `default` lines had failed and `ufw` was never
+actually enabled. `set -e` turns the first bad line into a visible
+`cloud-init status` failure instead of a silent no-op. Verify what actually
+took effect with `sudo ufw show added` (works even while `ufw` is inactive)
+rather than trusting that "no error printed" means "rule added".
+
+**The two CIDR rules are new, and non-optional once `ufw` actually enables.**
+`ufw default deny incoming` blocks *all* incoming traffic that isn't
+explicitly allowed — including traffic between k3s's own internal components,
+which travels over two private ranges: `10.42.0.0/16` (the pod network —
+every pod gets an address here) and `10.43.0.0/16` (the service network —
+stable virtual IPs for Kubernetes Services, including cluster DNS). Without
+allowing traffic *from* those ranges, CoreDNS lookups and pod-to-API-server
+traffic silently fail, which looks like a Kubernetes networking bug and has
+nothing to do with Kubernetes at all — it's the LAN firewall blocking
+loopback-style cluster traffic. (The broken first version never hit this,
+because it never actually enabled `ufw`.) These rules don't widen exposure
+from the LAN: nothing outside the cluster has an address in either range.
 
 ### `network-config.yaml.tpl`
 
@@ -653,24 +681,45 @@ turns any boot problem into a 15-minute hang. Even healthy, this module is
 slow: the VHDX copy/grow takes ~2m30s and VM creation can sit at
 `Still creating...` for many minutes. Don't assume slow means broken.
 
+**10. A passphrase-protected SSH key + `BatchMode=yes` looks exactly like
+"cloud-init didn't install the key" — it isn't.**
+This one isn't Windows/WSL-specific, but it cost real time here so it's worth
+recording. After the `apply`, every SSH attempt (all run non-interactively,
+with `-o BatchMode=yes` for scripting) returned the generic
+`Permission denied (publickey)`, and the natural read was "cloud-init never
+wrote `authorized_keys`". Wrong diagnosis. `ssh -v` told the real story:
+```
+debug1: Offering public key: ~/.ssh/id_ed25519 ...
+debug1: Server accepts key: ~/.ssh/id_ed25519 ...
+```
+`Server accepts key` only prints once the server has matched the *public*
+key against `authorized_keys` — so the key was installed correctly all
+along. The key's private half has a passphrase, and `BatchMode=yes` exists
+specifically to disable interactive prompts (so scripts don't hang forever
+waiting on stdin) — including the passphrase prompt. No agent was running to
+have it pre-unlocked, so the sign step silently failed and SSH reported the
+same generic denial it gives for a missing key. **Lesson: on any
+`Permission denied (publickey)`, run `ssh -v` and check for `Server accepts
+key` before suspecting the server side at all** — that line alone rules out
+an entire category of causes (key not in `authorized_keys`, wrong user,
+cloud-init datasource not read). The fix was simply to drop `BatchMode` and
+run `ssh` interactively so it could prompt for the passphrase.
+
 ## Where we are now
 
 `terraform apply -lock=false` completes: **7 added, 0 changed, 0 destroyed.**
-The VM runs, responds to ping at `192.168.50.178`, and answers on port 22 as
-Ubuntu 24.04.
+The VM runs, is reachable over SSH (see gotcha 10 above — the earlier
+"lockout" wasn't one), and `kubectl get nodes` from WSL shows
+`node1 Ready control-plane,master v1.31.5+k3s1`. The firewall problem
+described in the `ufw-setup.sh` section above was found and fixed while
+verifying this, and confirmed working: `ufw` active with all five rules,
+in-cluster DNS resolving, and pod egress to the internet working (proving
+flannel's own forwarding rules cover ufw's `deny (routed)` default).
 
-One problem remains open: **cloud-init did not install the SSH key**, so the
-VM is currently unreachable (key auth rejected, and no console password was
-ever set). The rendered `user-data`, the seed ISO contents, and the local
-keypair have all been verified correct, so the fault is somewhere inside the
-VM's cloud-init run rather than in anything Terraform produced.
-
-A lesson for next time that's worth carrying forward regardless of the cause:
-**always give a first-boot VM a break-glass console password** via cloud-init
-(`password:` plus `chpasswd: {expire: false}`, leaving `ssh_pwauth: false` so
-it stays console-only). Depending entirely on an SSH key that cloud-init
-itself has to install means a single cloud-init failure locks you out
-completely.
-
-See `docs/resume.md` for the exact diagnostic to run next and the full
-verified-already list, so none of that work gets repeated.
+Open items, none blocking, tracked in `docs/resume.md` under "Open M3 loose
+ends": add a break-glass console password to `user-data.yaml.tpl`
+(`password:` + `chpasswd: {expire: false}`, `ssh_pwauth: false` so it stays
+console-only — the fixed `ufw-setup.sh` was applied to the running VM by
+hand, not via a fresh `apply`, so this hasn't been exercised through a real
+first boot yet); then a full `destroy`/`apply` to prove the fixed script
+works unattended from a clean boot.

@@ -71,3 +71,9 @@ variable "vhd_destination_path" {
 variable "ssh_authorized_key" {
     type = string
 }
+
+variable "console_password" {
+  type        = string
+  description = "console emergency password in case locked out by fw rule"
+  sensitive   = true
+}
